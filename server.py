@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Live AI debate server — two random characters argue in real-time, forever."""
+"""Live AI debate — WhatsApp-style real-time chat."""
 
 import json, os, re, random, time, queue, threading
 from datetime import datetime, timezone
 from flask import Flask, Response
 
 # ━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BOOT      = time.time()
-MAX_UP    = 21300                    # 5 h 55 m
-MSG_GAP   = 30                       # seconds between messages
-MODEL     = "llama-3.1-8b-instant"
-BACKUP    = "meta-llama/llama-4-scout-17b-16e-instruct"
-PORT      = 8080
+BOOT     = time.time()
+MAX_UP   = 21300
+MSG_GAP  = 30
+MODEL    = "llama-3.1-8b-instant"
+BACKUP   = "meta-llama/llama-4-scout-17b-16e-instruct"
+PORT     = 8080
 
 # ━━ LOAD DATA ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with open("characters.json") as f:
@@ -19,774 +19,806 @@ with open("characters.json") as f:
 with open("topics.json") as f:
     ALL_TOPICS = json.load(f)
 
-# ━━ SHARED STATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ STATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 state = {
-    "char_a":    None,
-    "char_b":    None,
-    "topic":     None,
-    "topic_num": 0,
-    "messages":  [],
-    "typing":    None,
-    "boot":      BOOT,
-    "max_up":    MAX_UP,
+    "char_a": None, "char_b": None,
+    "topic": None, "topic_num": 0,
+    "messages": [], "typing": None,
 }
 
-# ━━ EVENT BUS (SSE) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-class EventBus:
+# ━━ SSE BUS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class Bus:
     def __init__(self):
-        self._listeners = []
+        self._q = []
         self._lock = threading.Lock()
 
     def listen(self):
-        q = queue.Queue(maxsize=200)
+        q = queue.Queue(maxsize=300)
         with self._lock:
-            self._listeners.append(q)
+            self._q.append(q)
         return q
 
-    def unlisten(self, q):
+    def drop(self, q):
         with self._lock:
-            try:
-                self._listeners.remove(q)
-            except ValueError:
-                pass
+            try: self._q.remove(q)
+            except ValueError: pass
 
-    def emit(self, event, data):
-        msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    def emit(self, ev, data):
+        m = f"event: {ev}\ndata: {json.dumps(data)}\n\n"
         dead = []
         with self._lock:
-            for q in self._listeners:
-                try:
-                    q.put_nowait(msg)
-                except queue.Full:
-                    dead.append(q)
+            for q in self._q:
+                try: q.put_nowait(m)
+                except queue.Full: dead.append(q)
             for q in dead:
-                try:
-                    self._listeners.remove(q)
-                except ValueError:
-                    pass
+                try: self._q.remove(q)
+                except ValueError: pass
 
-bus = EventBus()
+bus = Bus()
 
-# ━━ GROQ CALLER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_groq_client = None
-
-def get_groq():
-    global _groq_client
-    if _groq_client is None:
+# ━━ GROQ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_client = None
+def groq():
+    global _client
+    if not _client:
         from groq import Groq
-        _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
-    return _groq_client
+        _client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    return _client
 
-def call_llm(system, history, instruction, model=MODEL):
-    client = get_groq()
+def llm(system, history, instruction, model=MODEL):
     msgs = [{"role": "system", "content": system}]
-    msgs.extend(history[-14:])
+    msgs.extend(history[-12:])
     msgs.append({"role": "user", "content": instruction})
-
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=msgs,
-            temperature=0.85,
-            max_tokens=150,
-        )
-        text = resp.choices[0].message.content.strip()
-        text = re.sub(r'^[\w]+\s*[:—\-]\s*', '', text)
-        text = text.strip('"\'')
-        return text
+        r = groq().chat.completions.create(
+            model=model, messages=msgs,
+            temperature=0.85, max_tokens=150)
+        t = r.choices[0].message.content.strip()
+        t = re.sub(r'^[\w]+\s*[:—\-]\s*', '', t)
+        return t.strip('"\'')
     except Exception as e:
         if model == MODEL:
-            print(f"  ⚠ {MODEL} failed, trying backup: {str(e)[:80]}")
-            return call_llm(system, history, instruction, model=BACKUP)
+            return llm(system, history, instruction, BACKUP)
         raise
 
+# ━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def tleft():
+    return max(0, int(MAX_UP - (time.time() - BOOT)))
 
-# ━━ DEBATE ENGINE (background thread) ━━━━━━━━━━━━━━━━━━━
+def now_hm():
+    return datetime.now(timezone.utc).strftime("%H:%M")
+
+def now_full():
+    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+# ━━ ENGINE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def engine():
-    # pick two random characters
     chars = random.sample(ALL_CHARS, 2)
-    state["char_a"] = chars[0]
-    state["char_b"] = chars[1]
+    state["char_a"], state["char_b"] = chars[0], chars[1]
 
-    print(f"\n🎲 characters:")
-    print(f"   {chars[0]['avatar']} {chars[0]['name']} ({chars[0]['role']})")
-    print(f"   {chars[1]['avatar']} {chars[1]['name']} ({chars[1]['role']})")
+    print(f"\n🎲 {chars[0]['avatar']} {chars[0]['name']} vs {chars[1]['avatar']} {chars[1]['name']}")
 
-    history = []             # shared openai-style history
+    history = []
     turn = 0
-    msgs_on_topic = 0
-    msgs_per_topic = random.randint(10, 16)
-    used_topics = set()
+    on_topic = 0
+    per_topic = random.randint(10, 16)
+    used = set()
 
-    def pick_topic():
-        avail = [t for t in ALL_TOPICS if t not in used_topics]
-        if not avail:
-            used_topics.clear()
-            avail = list(ALL_TOPICS)
-        t = random.choice(avail)
-        used_topics.add(t)
+    def pick():
+        pool = [t for t in ALL_TOPICS if t not in used]
+        if not pool:
+            used.clear(); pool = list(ALL_TOPICS)
+        t = random.choice(pool)
+        used.add(t)
         return t
 
-    def now_str():
-        return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
-    def time_left():
-        return max(0, int(MAX_UP - (time.time() - BOOT)))
-
-    # ── first topic ──
-    topic = pick_topic()
-    state["topic"] = topic
-    state["topic_num"] = 1
-
-    print(f"\n📋 topic #1: \"{topic}\"")
+    topic = pick()
+    state["topic"], state["topic_num"] = topic, 1
+    print(f"📋 topic #1: \"{topic}\"")
 
     bus.emit("init", {
-        "char_a": state["char_a"],
-        "char_b": state["char_b"],
-        "topic": topic,
-        "topic_num": 1,
-        "boot": BOOT,
-        "max_up": MAX_UP,
+        "char_a": chars[0], "char_b": chars[1],
+        "topic": topic, "topic_num": 1,
+        "boot": BOOT, "max_up": MAX_UP,
     })
 
-    time.sleep(5)
+    # topic system message
+    tmsg = {"type": "topic", "text": topic, "number": 1, "time": now_hm()}
+    state["messages"].append(tmsg)
+    bus.emit("newtopic", tmsg)
 
-    # ── main loop ──
-    while time_left() > 60:
+    time.sleep(4)
 
-        # ── topic rotation ──
-        if msgs_on_topic >= msgs_per_topic:
-            topic = pick_topic()
+    while tleft() > 60:
+
+        # ── rotate topic ──
+        if on_topic >= per_topic:
+            topic = pick()
             state["topic"] = topic
             state["topic_num"] += 1
-            msgs_on_topic = 0
-            msgs_per_topic = random.randint(10, 16)
+            on_topic = 0
+            per_topic = random.randint(10, 16)
             history = history[-4:]
 
-            topic_msg = {
-                "type": "topic",
-                "text": topic,
-                "number": state["topic_num"],
-                "timestamp": now_str(),
-            }
-            state["messages"].append(topic_msg)
-            bus.emit("newtopic", topic_msg)
+            tmsg = {"type": "topic", "text": topic,
+                    "number": state["topic_num"], "time": now_hm()}
+            state["messages"].append(tmsg)
+            bus.emit("newtopic", tmsg)
             print(f"\n📋 topic #{state['topic_num']}: \"{topic}\"")
-            time.sleep(5)
+            time.sleep(4)
             continue
 
-        # ── determine speaker ──
-        current = chars[turn % 2]
+        turn_start = time.time()
+
+        cur = chars[turn % 2]
         other = chars[(turn + 1) % 2]
 
-        # ── broadcast typing ──
-        state["typing"] = current["name"]
+        # ── typing indicator ──
+        state["typing"] = cur["name"]
         bus.emit("typing", {
-            "speaker": current["name"],
-            "avatar": current["avatar"],
-            "color": current["color"],
-            "role": current["role"],
-            "time_left": time_left(),
+            "name": cur["name"], "avatar": cur["avatar"],
+            "color": cur["color"], "role": cur["role"],
         })
 
-        # ── wait before generating (typing illusion) ──
-        typing_wait = random.uniform(3, 6)
-        time.sleep(typing_wait)
+        # ── call LLM ──
+        system = f"""You are {cur['name']} — {cur['role']}.
+Personality: {cur['personality']}.
+Style: {cur['style']}.
+Debating "{topic}" with {other['name']} ({other['role']}).
+Under 80 words. Sharp, direct, conversational.
+Don't start with your name. No quotes. Engage their points."""
 
-        # ── build prompt ──
-        system = f"""You are {current['name']} — {current['role']}.
-Personality: {current['personality']}.
-Style: {current['style']}.
-You are in a live debate about "{topic}" with {other['name']} ({other['role']}).
-Keep responses under 80 words. Be sharp, direct, conversational.
-Don't start with your name. Don't wrap in quotes.
-Engage directly with what they said. Be natural."""
-
-        if msgs_on_topic == 0:
-            instruction = f'Topic: "{topic}"\nYou speak first. Share your opening thought. Under 80 words.'
+        if on_topic == 0:
+            inst = f'Topic: "{topic}"\nYou go first. Opening thought. Under 80 words.'
         else:
-            last_text = ""
+            last = ""
             for m in reversed(state["messages"]):
                 if m.get("type") != "topic" and m.get("speaker") == other["name"]:
-                    last_text = m["text"]
-                    break
-            instruction = f'Topic: "{topic}"\n{other["name"]} just said: "{last_text}"\nRespond directly. Under 80 words.'
+                    last = m["text"]; break
+            inst = f'Topic: "{topic}"\n{other["name"]} said: "{last}"\nRespond directly. Under 80 words.'
 
-        # ── call LLM ──
         try:
-            text = call_llm(system, history, instruction)
+            text = llm(system, history, inst)
         except Exception as e:
-            print(f"  ✖ LLM error: {str(e)[:100]}")
+            print(f"  ✖ {e}")
             time.sleep(10)
             continue
 
-        # ── build message ──
-        msg = {
-            "type": "message",
-            "speaker": current["name"],
-            "avatar": current["avatar"],
-            "color": current["color"],
-            "role": current["role"],
-            "text": text,
-            "timestamp": now_str(),
-            "msg_num": len([m for m in state["messages"] if m.get("type") != "topic"]) + 1,
-            "time_left": time_left(),
-            "topic": topic,
-            "topic_num": state["topic_num"],
-        }
+        # ── calculate word speed ──
+        elapsed = time.time() - turn_start
+        time_for_words = max(5, MSG_GAP - elapsed - 4)
+        words = text.split()
+        wps = max(0.06, min(time_for_words / max(len(words), 1), 0.5))
 
+        # ── start bubble ──
+        bus.emit("msgstart", {
+            "speaker": cur["name"], "avatar": cur["avatar"],
+            "color": cur["color"], "role": cur["role"],
+            "time": now_hm(),
+        })
+
+        # ── stream word by word ──
+        for i, w in enumerate(words):
+            bus.emit("word", {"w": w, "i": i, "of": len(words)})
+            time.sleep(wps)
+
+        # ── done ──
+        msg = {
+            "type": "message", "speaker": cur["name"],
+            "avatar": cur["avatar"], "color": cur["color"],
+            "role": cur["role"], "text": text, "time": now_hm(),
+        }
         state["messages"].append(msg)
         state["typing"] = None
-
-        # ── update openai-style history ──
-        role_tag = "assistant" if turn % 2 == 0 else "user"
-        history.append({"role": role_tag, "content": text})
-
-        # ── emit words one by one ──
-        words = text.split()
-        chunks = []
-        chunk = []
-        for w in words:
-            chunk.append(w)
-            if len(chunk) >= 3:
-                chunks.append(" ".join(chunk))
-                chunk = []
-        if chunk:
-            chunks.append(" ".join(chunk))
-
-        # first emit starts the bubble
-        bus.emit("msgstart", {
-            "speaker": current["name"],
-            "avatar": current["avatar"],
-            "color": current["color"],
-            "role": current["role"],
-            "timestamp": now_str(),
-            "msg_num": msg["msg_num"],
-            "time_left": time_left(),
+        history.append({
+            "role": "assistant" if turn % 2 == 0 else "user",
+            "content": text
         })
 
-        # stream chunks
-        for i, c in enumerate(chunks):
-            bus.emit("msgchunk", {
-                "speaker": current["name"],
-                "chunk": c,
-                "index": i,
-                "total": len(chunks),
-            })
-            time.sleep(random.uniform(0.15, 0.4))
-
-        # signal message complete
         bus.emit("msgdone", {
-            "speaker": current["name"],
-            "full_text": text,
-            "msg_num": msg["msg_num"],
+            "speaker": cur["name"], "text": text, "time": now_hm(),
         })
 
-        print(f"  {current['avatar']} {current['name']}: {text[:70]}...")
+        print(f"  {cur['avatar']} {cur['name']}: {text[:70]}...")
 
         turn += 1
-        msgs_on_topic += 1
+        on_topic += 1
 
-        # ── wait between messages ──
-        remaining_gap = MSG_GAP - typing_wait
-        if remaining_gap > 0 and time_left() > 90:
+        # ── wait remaining gap ──
+        total = time.time() - turn_start
+        wait = MSG_GAP - total
+        if wait > 0 and tleft() > 90:
+            nxt = chars[turn % 2]
             bus.emit("waiting", {
-                "next_speaker": chars[turn % 2]["name"],
-                "next_avatar": chars[turn % 2]["avatar"],
-                "next_color": chars[turn % 2]["color"],
-                "gap": int(remaining_gap),
-                "time_left": time_left(),
+                "name": nxt["name"], "avatar": nxt["avatar"],
+                "color": nxt["color"], "gap": int(wait),
+                "timeleft": tleft(),
             })
-            time.sleep(remaining_gap)
+            time.sleep(wait)
 
-    # ── server dying ──
+    # ── shutdown ──
+    cnt = len([m for m in state["messages"] if m.get("type") != "topic"])
     bus.emit("shutdown", {
-        "message": "Server shutting down. Next cycle starts on schedule.",
-        "total_messages": len([m for m in state["messages"] if m.get("type") != "topic"]),
-        "total_topics": state["topic_num"],
+        "total_msgs": cnt, "total_topics": state["topic_num"],
     })
-    print("\n⏰ Time's up. Shutting down.")
+    print(f"\n⏰ Done. {cnt} messages, {state['topic_num']} topics.")
 
 
-# ━━ FLASK APP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ FLASK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 app = Flask(__name__)
 
 @app.route("/stream")
 def stream():
     q = bus.listen()
-
     def gen():
-        # send current state on connect
-        init = {
-            "char_a": state["char_a"],
-            "char_b": state["char_b"],
-            "topic": state["topic"],
-            "topic_num": state["topic_num"],
-            "messages": state["messages"][-50:],
-            "typing": state["typing"],
-            "boot": BOOT,
-            "max_up": MAX_UP,
-            "time_left": max(0, int(MAX_UP - (time.time() - BOOT))),
-        }
-        yield f"event: fullstate\ndata: {json.dumps(init)}\n\n"
-
+        yield f"event: fullstate\ndata: {json.dumps({
+            'char_a': state['char_a'], 'char_b': state['char_b'],
+            'topic': state['topic'], 'topic_num': state['topic_num'],
+            'messages': state['messages'][-80:],
+            'typing': state['typing'],
+            'boot': BOOT, 'max_up': MAX_UP,
+            'timeleft': tleft(),
+        })}\n\n"
         try:
             while True:
                 try:
-                    msg = q.get(timeout=30)
-                    yield msg
+                    yield q.get(timeout=25)
                 except queue.Empty:
-                    yield f"event: ping\ndata: {json.dumps({'time_left': max(0, int(MAX_UP - (time.time() - BOOT)))})}\n\n"
+                    yield f"event: ping\ndata: {json.dumps({'tl': tleft()})}\n\n"
         except GeneratorExit:
-            bus.unlisten(q)
-
+            bus.drop(q)
     return Response(gen(), content_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-
 @app.route("/")
 def index():
-    return PAGE_HTML
+    return HTML
 
 
-# ━━ HTML PAGE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PAGE_HTML = r"""<!DOCTYPE html>
+# ━━ HTML ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>MindDuel — Live AI Debate</title>
 <style>
-:root{--bg:#0a0a0a;--sf:#111;--bd:#1a1a1a;--tx:#b0b0b0;--dm:#555;--gn:#0f0}
+:root{
+  --wa-bg:#0b141a;
+  --wa-hdr:#1f2c34;
+  --wa-in:#1f2c34;
+  --wa-out:#005c4b;
+  --wa-text:#e9edef;
+  --wa-text2:#8696a0;
+  --wa-green:#00a884;
+  --wa-blue:#53bdeb;
+  --wa-sys:#182229;
+  --wa-border:#2a3942;
+  --wa-input:#1f2c34;
+}
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
 body{
-  font-family:'SF Mono','Fira Code',Consolas,monospace;
-  background:var(--bg);color:var(--tx);min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:#111;color:var(--wa-text);
+  display:flex;justify-content:center;
+}
+
+/* ── app shell ── */
+.app{
+  width:100%;max-width:500px;height:100vh;height:100dvh;
   display:flex;flex-direction:column;
+  background:var(--wa-bg);
+  box-shadow:0 0 60px rgba(0,0,0,.6);
 }
 
-/* header */
+/* ── header ── */
 .hdr{
-  text-align:center;padding:1.5rem 1rem .8rem;
-  border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;gap:.6rem;
+  padding:.5rem .8rem;
+  background:var(--wa-hdr);
+  min-height:56px;
+  z-index:10;
 }
-.hdr h1{font-size:1.3rem;color:#fff;letter-spacing:.04em}
-.hdr .sub{color:var(--dm);font-size:.7rem;margin-top:.3rem}
-
-/* status bar */
-.bar{
-  display:flex;justify-content:center;gap:1.5rem;
-  padding:.6rem 1rem;border-bottom:1px solid var(--bd);
-  font-size:.7rem;color:var(--dm);flex-wrap:wrap;
+.hdr-ava{
+  width:40px;height:40px;border-radius:50%;
+  background:var(--wa-border);
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.2rem;
 }
-.bar .item{display:flex;align-items:center;gap:.3rem}
-.dot{width:7px;height:7px;border-radius:50%;animation:pulse 1.5s ease-in-out infinite}
-@keyframes pulse{50%{opacity:.2}}
-.alive .dot{background:var(--gn)}
-.dead .dot{background:#f44}
-
-/* topic banner */
-.topic-bar{
-  text-align:center;padding:.8rem 1rem;
-  background:#0f01;border-bottom:1px solid #0f03;
+.hdr-info{flex:1;min-width:0}
+.hdr-name{font-size:.95rem;font-weight:600;color:var(--wa-text)}
+.hdr-sub{font-size:.75rem;color:var(--wa-text2);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.hdr-sub.typing{color:var(--wa-green)}
+.hdr-right{display:flex;align-items:center;gap:.3rem;font-size:.65rem;color:var(--wa-text2)}
+.hdr-timer{
+  background:rgba(255,68,68,.15);color:#f44;
+  padding:.15rem .5rem;border-radius:10px;
+  font-weight:600;font-size:.7rem;
 }
-.topic-bar .label{font-size:.6rem;color:var(--gn);letter-spacing:.1em;text-transform:uppercase}
-.topic-bar .text{color:#fff;font-size:1rem;font-weight:bold;margin-top:.2rem}
-
-/* versus */
-.vs{
-  display:flex;justify-content:center;align-items:center;gap:1.5rem;
-  padding:1rem;border-bottom:1px solid var(--bd);
+.hdr-msgs{
+  background:rgba(0,168,132,.15);color:var(--wa-green);
+  padding:.15rem .5rem;border-radius:10px;
+  font-weight:600;font-size:.7rem;
 }
-.fighter{text-align:center;min-width:100px}
-.fighter .ava{font-size:2rem}
-.fighter .nm{font-weight:bold;font-size:.85rem;margin-top:.2rem}
-.fighter .rl{font-size:.65rem;margin-top:.1rem}
-.vs-x{color:var(--dm);font-size:1.2rem;font-weight:bold}
 
-/* chat */
+/* ── chat area ── */
 .chat{
-  flex:1;overflow-y:auto;padding:1rem;
-  max-width:750px;width:100%;margin:0 auto;
+  flex:1;overflow-y:auto;overflow-x:hidden;
+  padding:.5rem .6rem;
+  background:var(--wa-bg);
+  background-image:
+    radial-gradient(circle at 20% 50%,rgba(0,168,132,.02) 0%,transparent 50%),
+    radial-gradient(circle at 80% 20%,rgba(83,189,235,.02) 0%,transparent 50%);
+  scroll-behavior:smooth;
 }
+.chat::-webkit-scrollbar{width:4px}
+.chat::-webkit-scrollbar-thumb{background:var(--wa-border);border-radius:4px}
 
-/* system message */
-.sys{
-  text-align:center;margin:1.5rem 0;
-  padding:.5rem;
-}
-.sys .pill{
+/* ── system pill ── */
+.sys{text-align:center;margin:.8rem 0}
+.pill{
   display:inline-block;
-  background:#111;border:1px solid var(--bd);
-  border-radius:20px;padding:.3rem 1rem;
-  font-size:.7rem;color:var(--dm);
+  background:var(--wa-sys);
+  color:var(--wa-text2);
+  padding:.35rem .8rem;
+  border-radius:8px;
+  font-size:.75rem;
+  max-width:85%;
+  line-height:1.4;
+  box-shadow:0 1px 1px rgba(0,0,0,.2);
 }
-.sys .topic-change{
-  display:block;color:#fff;font-weight:bold;
-  font-size:.9rem;margin-top:.3rem;
+.pill.topic{color:var(--wa-text);font-weight:600}
+
+/* ── date separator ── */
+.datesep{text-align:center;margin:.6rem 0}
+.datesep span{
+  background:var(--wa-sys);color:var(--wa-text2);
+  padding:.3rem .8rem;border-radius:8px;
+  font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.04em;
+  box-shadow:0 1px 1px rgba(0,0,0,.2);
 }
 
-/* bubble */
-.bubble{margin-bottom:1rem;display:flex;flex-direction:column;animation:fadeIn .3s ease}
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.bubble.left{align-items:flex-start}
-.bubble.right{align-items:flex-end}
-.bubble .head{
-  display:flex;align-items:center;gap:.4rem;
-  font-size:.7rem;font-weight:bold;margin-bottom:.25rem;padding:0 .3rem;
+/* ── message bubble ── */
+.msg{
+  display:flex;flex-direction:column;
+  margin-bottom:2px;
+  animation:fadeUp .25s ease;
 }
-.bubble .time{font-weight:normal;color:var(--dm);font-size:.6rem;margin-left:.3rem}
-.bubble .body{
-  max-width:80%;padding:.8rem 1rem;border-radius:14px;
-  font-size:.85rem;line-height:1.55;
-  background:var(--sf);border:1px solid var(--bd);
-  min-height:1.4em;
-}
-.bubble.left .body{border-radius:4px 14px 14px 14px}
-.bubble.right .body{border-radius:14px 4px 14px 14px}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg.left{align-items:flex-start;padding-right:3rem}
+.msg.right{align-items:flex-end;padding-left:3rem}
 
-/* typing indicator */
-.typing-indicator{
-  display:inline-flex;gap:4px;align-items:center;padding:4px 0;
+.msg .body{
+  position:relative;
+  padding:.4rem .5rem .15rem .55rem;
+  border-radius:8px;
+  max-width:100%;
+  font-size:.9rem;
+  line-height:1.35;
+  word-wrap:break-word;
+  box-shadow:0 1px 1px rgba(0,0,0,.15);
 }
-.typing-indicator span{
-  width:6px;height:6px;border-radius:50%;background:#555;
-  animation:blink 1.4s ease-in-out infinite;
+.msg.left .body{background:var(--wa-in);border-top-left-radius:0}
+.msg.right .body{background:var(--wa-out);border-top-right-radius:0}
+
+/* tails */
+.msg.left .body::before{
+  content:'';position:absolute;top:0;left:-7px;
+  width:0;height:0;
+  border-top:0 solid transparent;
+  border-right:8px solid var(--wa-in);
+  border-bottom:8px solid transparent;
 }
-.typing-indicator span:nth-child(2){animation-delay:.2s}
-.typing-indicator span:nth-child(3){animation-delay:.4s}
-@keyframes blink{0%,80%,100%{opacity:.3}40%{opacity:1}}
+.msg.right .body::before{
+  content:'';position:absolute;top:0;right:-7px;
+  width:0;height:0;
+  border-top:0 solid transparent;
+  border-left:8px solid var(--wa-out);
+  border-bottom:8px solid transparent;
+}
+
+/* consecutive from same side: no tail, closer spacing */
+.msg.cont .body{border-radius:8px}
+.msg.cont .body::before{display:none}
+.msg.cont{margin-top:1px}
+
+.msg .who{
+  font-size:.8rem;font-weight:600;
+  margin-bottom:1px;
+}
+
+.msg .txt{
+  color:var(--wa-text);
+}
+
+/* meta: time + ticks float bottom-right */
+.msg .meta{
+  float:right;
+  display:flex;align-items:center;gap:3px;
+  margin-left:8px;margin-top:3px;
+  font-size:.65rem;
+  color:rgba(255,255,255,.45);
+  white-space:nowrap;
+}
+.msg .ticks{color:var(--wa-blue);font-size:.7rem}
+
+/* spacer so text doesn't overlap meta */
+.msg .spacer{
+  display:inline-block;width:4.5rem;height:1px;
+}
 
 /* cursor */
 .cursor{
-  display:inline-block;width:2px;height:1em;
-  background:currentColor;margin-left:2px;
-  animation:cursorBlink .8s step-end infinite;
+  display:inline-block;width:2px;height:.95em;
+  background:var(--wa-green);margin-left:1px;
+  animation:blinkcur .7s step-end infinite;
   vertical-align:text-bottom;
 }
-@keyframes cursorBlink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes blinkcur{0%,100%{opacity:1}50%{opacity:0}}
 
-/* countdown bar */
-.countdown{
-  text-align:center;padding:.8rem;
-  border-top:1px solid var(--bd);
-  font-size:.7rem;color:var(--dm);
+/* ── typing dots (in bubble) ── */
+.typing-dots{
+  display:inline-flex;gap:3px;align-items:center;padding:4px 0;
 }
-.countdown .next{color:var(--tx)}
-.countdown .death{color:#f44;margin-left:1rem}
+.typing-dots span{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--wa-text2);
+  animation:dotpulse 1.4s ease-in-out infinite;
+}
+.typing-dots span:nth-child(2){animation-delay:.2s}
+.typing-dots span:nth-child(3){animation-delay:.4s}
+@keyframes dotpulse{0%,80%,100%{opacity:.3;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
 
-.shutdown-msg{
-  text-align:center;padding:2rem;color:#f44;font-size:.9rem;
-  border-top:1px solid #f44;margin-top:1rem;
+/* ── bottom bar ── */
+.bottom{
+  display:flex;align-items:center;
+  padding:.5rem .8rem;
+  background:var(--wa-hdr);
+  min-height:48px;
+  gap:.5rem;
+  border-top:1px solid var(--wa-border);
+}
+.bottom-status{
+  flex:1;font-size:.8rem;color:var(--wa-text2);
+}
+.bottom-status .who-next{color:var(--wa-green);font-weight:600}
+.bottom-status .countdown{
+  font-size:.75rem;
+  color:var(--wa-text2);
 }
 
+/* ── shutdown banner ── */
+.shutdown{
+  text-align:center;padding:1.5rem 1rem;
+  background:rgba(244,67,54,.1);
+  border-top:1px solid rgba(244,67,54,.3);
+}
+.shutdown .big{color:#f44;font-size:.9rem;font-weight:600}
+.shutdown .small{color:var(--wa-text2);font-size:.7rem;margin-top:.3rem}
+
+/* ── responsive ── */
 @media(max-width:500px){
-  .bubble .body{max-width:92%;font-size:.8rem}
-  .hdr h1{font-size:1rem}
-  .vs{gap:.8rem}
-  .fighter .ava{font-size:1.5rem}
+  .app{max-width:100%}
+  .msg .body{font-size:.88rem}
+}
+@media(min-width:501px){
+  body{align-items:center;padding:1rem 0}
+  .app{border-radius:12px;height:96vh;overflow:hidden}
 }
 </style>
 </head><body>
+<div class="app">
 
-<div class="hdr">
-  <h1>⚔️ MindDuel</h1>
-  <div class="sub">live ai debate — continuous until shutdown</div>
-</div>
-
-<div class="bar" id="statusbar">
-  <div class="item alive"><div class="dot"></div><span id="status-text">connecting...</span></div>
-  <div class="item">⏱ server: <span id="uptime">--</span></div>
-  <div class="item">💀 dies in: <span id="timeleft" style="color:#f44">--</span></div>
-  <div class="item">💬 <span id="msgcount">0</span> messages</div>
-</div>
-
-<div class="topic-bar" id="topicbar">
-  <div class="label">topic #<span id="topicnum">0</span></div>
-  <div class="text" id="topictext">loading...</div>
-</div>
-
-<div class="vs" id="vsbar" style="display:none">
-  <div class="fighter" id="fa">
-    <div class="ava" id="fa-ava"></div>
-    <div class="nm" id="fa-name"></div>
-    <div class="rl" id="fa-role"></div>
+  <!-- header -->
+  <div class="hdr">
+    <div class="hdr-ava" id="hdr-ava">⚔️</div>
+    <div class="hdr-info">
+      <div class="hdr-name">MindDuel</div>
+      <div class="hdr-sub" id="hdr-sub">connecting...</div>
+    </div>
+    <div class="hdr-right">
+      <div class="hdr-msgs" id="msg-count">💬 0</div>
+      <div class="hdr-timer" id="timer">💀 --:--</div>
+    </div>
   </div>
-  <div class="vs-x">vs</div>
-  <div class="fighter" id="fb">
-    <div class="ava" id="fb-ava"></div>
-    <div class="nm" id="fb-name"></div>
-    <div class="rl" id="fb-role"></div>
+
+  <!-- chat -->
+  <div class="chat" id="chat"></div>
+
+  <!-- bottom -->
+  <div class="bottom" id="bottom">
+    <div class="bottom-status" id="bottom-status">
+      connecting...
+    </div>
   </div>
-</div>
 
-<div class="chat" id="chat"></div>
-
-<div class="countdown" id="countdown">
-  <span class="next" id="next-label">waiting...</span>
 </div>
 
 <script>
-const $=s=>document.getElementById(s);
+const $=id=>document.getElementById(id);
 const chat=$('chat');
-let msgCount=0;
-let bootTime=0;
-let maxUp=0;
-let charA=null,charB=null;
-let typingBubble=null;
-let currentBubbleBody=null;
-let timerInterval=null;
 
-function scrollBottom(){
+let charA=null,charB=null;
+let bootTime=0,maxUp=0;
+let msgCount=0;
+let lastSpeaker='';
+let currentBubble=null;
+let currentTxt=null;
+let wordBuffer=[];
+let timerIv=null;
+let typing_bubble=null;
+
+/* ── helpers ── */
+function scroll(){
   chat.scrollTop=chat.scrollHeight;
 }
 
-function formatTime(s){
+function fmtTime(s){
   s=Math.max(0,Math.floor(s));
   const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
-  if(h>0)return h+'h '+m+'m '+sec+'s';
-  if(m>0)return m+'m '+sec+'s';
-  return sec+'s';
+  if(h>0)return h+'h '+String(m).padStart(2,'0')+'m';
+  return m+'m '+String(sec).padStart(2,'0')+'s';
 }
 
 function startTimers(){
-  if(timerInterval)clearInterval(timerInterval);
-  timerInterval=setInterval(()=>{
+  if(timerIv)clearInterval(timerIv);
+  timerIv=setInterval(()=>{
     const now=Date.now()/1000;
-    const up=now-bootTime;
-    const left=Math.max(0,maxUp-up);
-    $('uptime').textContent=formatTime(up);
-    $('timeleft').textContent=formatTime(left);
-    if(left<300){
-      $('timeleft').style.color='#f44';
-      $('timeleft').style.fontWeight='bold';
-    }
+    const left=Math.max(0,maxUp-(now-bootTime));
+    $('timer').textContent='💀 '+fmtTime(left);
+    if(left<300)$('timer').style.background='rgba(244,67,54,.3)';
     if(left<=0){
-      $('status-text').textContent='OFFLINE';
-      document.querySelector('.dot').style.background='#f44';
-      clearInterval(timerInterval);
+      $('timer').textContent='💀 DEAD';
+      clearInterval(timerIv);
     }
   },1000);
 }
 
-function setChars(a,b){
-  charA=a;charB=b;
-  $('vsbar').style.display='flex';
-  $('fa-ava').textContent=a.avatar;
-  $('fa-name').textContent=a.name;
-  $('fa-name').style.color=a.color;
-  $('fa-role').textContent=a.role;
-  $('fa-role').style.color=a.color;
-  $('fb-ava').textContent=b.avatar;
-  $('fb-name').textContent=b.name;
-  $('fb-name').style.color=b.color;
-  $('fb-role').textContent=b.role;
-  $('fb-role').style.color=b.color;
-}
-
-function setTopic(text,num){
-  $('topictext').textContent='"'+text+'"';
-  $('topicnum').textContent=num;
-}
-
-function sideFor(name){
+function side(name){
   if(!charA)return'left';
   return name===charA.name?'left':'right';
 }
 
-function colorFor(name){
-  if(charA&&name===charA.name)return charA.color;
-  if(charB&&name===charB.name)return charB.color;
-  return'#aaa';
-}
-
-function addSystemMsg(html){
+/* ── render helpers ── */
+function addSysPill(html,cls){
   const d=document.createElement('div');
   d.className='sys';
-  d.innerHTML=html;
+  d.innerHTML=`<span class="pill ${cls||''}">${html}</span>`;
   chat.appendChild(d);
-  scrollBottom();
+  scroll();
 }
 
-function removeTyping(){
-  if(typingBubble){
-    typingBubble.remove();
-    typingBubble=null;
-    currentBubbleBody=null;
+function addDateSep(text){
+  const d=document.createElement('div');
+  d.className='datesep';
+  d.innerHTML=`<span>${text}</span>`;
+  chat.appendChild(d);
+  scroll();
+}
+
+function addTopicPill(t){
+  addSysPill(`📋 Topic #${t.number}: "${t.text}"`,'topic');
+}
+
+function removeTypingBubble(){
+  if(typing_bubble){
+    typing_bubble.remove();
+    typing_bubble=null;
   }
 }
 
-function addTypingBubble(speaker,avatar,color,role){
-  removeTyping();
-  const side=sideFor(speaker);
+function addTypingBubble(name,avatar,color,role){
+  removeTypingBubble();
+  const s=side(name);
+  const cont=(lastSpeaker===name);
   const d=document.createElement('div');
-  d.className='bubble '+side;
-  d.innerHTML=`
-    <div class="head" style="color:${color}">
-      ${avatar} ${speaker} · ${role}
-    </div>
-    <div class="body" style="border-${side==='left'?'left':'right'}:3px solid ${color}">
-      <div class="typing-indicator"><span></span><span></span><span></span></div>
-    </div>`;
+  d.className=`msg ${s}${cont?' cont':''}`;
+  let inner='';
+  if(!cont){
+    inner+=`<div class="who" style="color:${color}">${avatar} ${name}</div>`;
+  }
+  inner+=`<div class="body"><div class="typing-dots"><span></span><span></span><span></span></div></div>`;
+  d.innerHTML=inner;
   chat.appendChild(d);
-  typingBubble=d;
-  scrollBottom();
+  typing_bubble=d;
+  scroll();
 }
 
-function startMessageBubble(speaker,avatar,color,role,timestamp){
-  removeTyping();
-  const side=sideFor(speaker);
+function startBubble(speaker,avatar,color,role,timeStr){
+  removeTypingBubble();
+  const s=side(speaker);
+  const cont=(lastSpeaker===speaker);
   const d=document.createElement('div');
-  d.className='bubble '+side;
-  d.innerHTML=`
-    <div class="head" style="color:${color}">
-      ${avatar} ${speaker} · ${role}
-      <span class="time">${timestamp}</span>
-    </div>
-    <div class="body" style="border-${side==='left'?'left':'right'}:3px solid ${color}">
-      <span class="words"></span><span class="cursor"></span>
-    </div>`;
+  d.className=`msg ${s}${cont?' cont':''}`;
+
+  let inner='';
+  if(!cont){
+    inner+=`<div class="who" style="color:${color}">${avatar} ${speaker}</div>`;
+  }
+  inner+=`<div class="body">`;
+  inner+=`<span class="meta"><span class="tm">${timeStr}</span></span>`;
+  inner+=`<span class="txt"></span>`;
+  inner+=`<span class="cursor"></span>`;
+  inner+=`<span class="spacer"></span>`;
+  inner+=`</div>`;
+
+  d.innerHTML=inner;
   chat.appendChild(d);
-  currentBubbleBody=d.querySelector('.words');
-  scrollBottom();
-  return d;
+  currentBubble=d;
+  currentTxt=d.querySelector('.txt');
+  scroll();
 }
 
-function appendChunk(text){
-  if(!currentBubbleBody)return;
-  const prev=currentBubbleBody.textContent;
-  currentBubbleBody.textContent=prev?(prev+' '+text):text;
-  scrollBottom();
+function appendWord(w){
+  if(!currentTxt)return;
+  if(currentTxt.textContent.length>0){
+    currentTxt.textContent+=' '+w;
+  } else {
+    currentTxt.textContent=w;
+  }
+  scroll();
 }
 
-function finishMessage(el){
-  if(!el)return;
-  const cursor=el.querySelector('.cursor');
-  if(cursor)cursor.remove();
-  currentBubbleBody=null;
+function finishBubble(speaker,timeStr){
+  if(currentBubble){
+    const cur=currentBubble.querySelector('.cursor');
+    if(cur)cur.remove();
+    const meta=currentBubble.querySelector('.meta');
+    if(meta){
+      meta.innerHTML=`<span class="tm">${timeStr}</span><span class="ticks"> ✓✓</span>`;
+    }
+  }
+  lastSpeaker=speaker;
+  currentBubble=null;
+  currentTxt=null;
   msgCount++;
-  $('msgcount').textContent=msgCount;
+  $('msg-count').textContent='💬 '+msgCount;
+  scroll();
 }
 
-function addFullMessage(m){
-  const side=sideFor(m.speaker);
-  const color=m.color||colorFor(m.speaker);
+function addFullMsg(m){
+  const s=side(m.speaker);
+  const cont=(lastSpeaker===m.speaker);
   const d=document.createElement('div');
-  d.className='bubble '+side;
-  d.innerHTML=`
-    <div class="head" style="color:${color}">
-      ${m.avatar||''} ${m.speaker} · ${m.role||''}
-      <span class="time">${m.timestamp||''}</span>
-    </div>
-    <div class="body" style="border-${side==='left'?'left':'right'}:3px solid ${color}">
-      ${m.text}
-    </div>`;
+  d.className=`msg ${s}${cont?' cont':''}`;
+
+  let inner='';
+  if(!cont){
+    inner+=`<div class="who" style="color:${m.color}">${m.avatar} ${m.speaker}</div>`;
+  }
+  inner+=`<div class="body">`;
+  inner+=`<span class="meta"><span class="tm">${m.time||''}</span><span class="ticks"> ✓✓</span></span>`;
+  inner+=`<span class="txt">${m.text}</span>`;
+  inner+=`<span class="spacer"></span>`;
+  inner+=`</div>`;
+
+  d.innerHTML=inner;
   chat.appendChild(d);
+  lastSpeaker=m.speaker;
   msgCount++;
-  $('msgcount').textContent=msgCount;
 }
 
-function addTopicChange(t){
-  addSystemMsg(`
-    <div class="pill">topic #${t.number}</div>
-    <div class="topic-change">"${t.text}"</div>
-  `);
-  setTopic(t.text,t.number);
+function setHeaderSub(html){
+  $('hdr-sub').innerHTML=html;
 }
 
-// ── SSE ──────────────────────────────────────────────
-let currentMsgEl=null;
+function setBottom(html){
+  $('bottom-status').innerHTML=html;
+}
 
+/* ── SSE ── */
 function connect(){
-  $('status-text').textContent='connecting...';
+  setHeaderSub('connecting...');
   const es=new EventSource('/stream');
 
   es.addEventListener('fullstate',e=>{
     const d=JSON.parse(e.data);
-    bootTime=d.boot;
-    maxUp=d.max_up;
-    if(d.char_a&&d.char_b)setChars(d.char_a,d.char_b);
-    if(d.topic)setTopic(d.topic,d.topic_num);
-    // render history
+    bootTime=d.boot; maxUp=d.max_up;
+    charA=d.char_a; charB=d.char_b;
+    if(charA&&charB){
+      setHeaderSub(`${charA.avatar} ${charA.name}, ${charB.avatar} ${charB.name}`);
+    }
+
     chat.innerHTML='';
-    msgCount=0;
+    msgCount=0;lastSpeaker='';
+
+    addSysPill('🔒 AI-generated debate · live via Groq','');
+    addDateSep('TODAY');
+
     if(d.messages){
       d.messages.forEach(m=>{
-        if(m.type==='topic'){
-          addTopicChange(m);
-        } else if(m.type==='message'){
-          addFullMessage(m);
-        }
+        if(m.type==='topic') addTopicPill(m);
+        else if(m.type==='message') addFullMsg(m);
       });
     }
-    $('status-text').textContent='LIVE';
+
+    $('msg-count').textContent='💬 '+msgCount;
     startTimers();
-    scrollBottom();
+    scroll();
+    setBottom(`<span class="who-next">● LIVE</span> — waiting for next message...`);
   });
 
   es.addEventListener('newtopic',e=>{
     const d=JSON.parse(e.data);
-    addTopicChange(d);
+    addTopicPill(d);
+    setHeaderSub(`${charA.avatar} ${charA.name}, ${charB.avatar} ${charB.name}`);
   });
 
   es.addEventListener('typing',e=>{
     const d=JSON.parse(e.data);
-    addTypingBubble(d.speaker,d.avatar,d.color,d.role);
-    $('next-label').textContent=d.speaker+' is thinking...';
+    addTypingBubble(d.name,d.avatar,d.color,d.role);
+    setHeaderSub(`<span class="typing">${d.name} is typing...</span>`);
+    setBottom(`<span style="color:${d.color}">${d.avatar} ${d.name}</span> is typing...`);
   });
 
   es.addEventListener('msgstart',e=>{
     const d=JSON.parse(e.data);
-    currentMsgEl=startMessageBubble(d.speaker,d.avatar,d.color,d.role,d.timestamp);
-    $('next-label').textContent=d.speaker+' is speaking...';
+    startBubble(d.speaker,d.avatar,d.color,d.role,d.time);
+    setHeaderSub(`<span class="typing">${d.speaker} is speaking...</span>`);
+    setBottom(`<span style="color:${d.color}">${d.avatar} ${d.speaker}</span> is speaking...`);
   });
 
-  es.addEventListener('msgchunk',e=>{
+  es.addEventListener('word',e=>{
     const d=JSON.parse(e.data);
-    appendChunk(d.chunk);
+    appendWord(d.w);
   });
 
   es.addEventListener('msgdone',e=>{
-    finishMessage(currentMsgEl);
-    currentMsgEl=null;
-    $('next-label').textContent='waiting for next turn...';
+    const d=JSON.parse(e.data);
+    finishBubble(d.speaker,d.time);
+    if(charA&&charB){
+      setHeaderSub(`${charA.avatar} ${charA.name}, ${charB.avatar} ${charB.name}`);
+    }
+    setBottom(`<span class="who-next">● LIVE</span> — waiting for next message...`);
   });
 
   es.addEventListener('waiting',e=>{
     const d=JSON.parse(e.data);
     let gap=d.gap;
-    $('next-label').innerHTML=
-      `${d.next_avatar} <span style="color:${d.next_color}">${d.next_speaker}</span> responds in <span id="gap-sec">${gap}s</span>`;
-    const gi=setInterval(()=>{
+    setBottom(
+      `<span style="color:${d.color}">${d.avatar} ${d.name}</span> responds in `+
+      `<span class="countdown" id="gap-cd">${gap}s</span>`
+    );
+    const iv=setInterval(()=>{
       gap--;
-      const el=document.getElementById('gap-sec');
+      const el=document.getElementById('gap-cd');
       if(el)el.textContent=gap+'s';
-      if(gap<=0)clearInterval(gi);
+      if(gap<=0){
+        clearInterval(iv);
+        setBottom(`<span class="who-next">● LIVE</span> — next message incoming...`);
+      }
     },1000);
   });
 
   es.addEventListener('shutdown',e=>{
     const d=JSON.parse(e.data);
-    removeTyping();
+    removeTypingBubble();
+
     const div=document.createElement('div');
-    div.className='shutdown-msg';
-    div.innerHTML=`⚠️ ${d.message}<br>
-      <span style="font-size:.75rem;color:var(--dm)">
-        ${d.total_messages} messages · ${d.total_topics} topics debated
-      </span>`;
+    div.className='shutdown';
+    div.innerHTML=
+      `<div class="big">⚠️ Server shutting down</div>`+
+      `<div class="small">Next cycle starts on schedule</div>`+
+      `<div class="small">${d.total_msgs} messages · ${d.total_topics} topics debated</div>`;
     chat.appendChild(div);
-    scrollBottom();
-    $('status-text').textContent='OFFLINE';
-    document.querySelector('.dot').style.background='#f44';
-    $('next-label').textContent='server offline — next cycle on schedule';
+    scroll();
+
+    setHeaderSub('offline — next cycle on schedule');
+    setBottom('🔴 Server offline');
+    $('timer').textContent='💀 DEAD';
+    $('timer').style.background='rgba(244,67,54,.4)';
+    if(timerIv)clearInterval(timerIv);
   });
 
   es.addEventListener('ping',e=>{
-    const d=JSON.parse(e.data);
-    // keep alive
+    /* keep alive */
   });
 
   es.onerror=()=>{
-    $('status-text').textContent='reconnecting...';
+    setHeaderSub('reconnecting...');
+    setBottom('⚠️ connection lost — reconnecting...');
     es.close();
     setTimeout(connect,3000);
   };
@@ -800,7 +832,7 @@ connect();
 # ━━ START ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     print("=" * 50)
-    print("⚔️  MindDuel — Live AI Debate Server")
+    print("⚔️  MindDuel — Live AI Debate")
     print(f"   model   : {MODEL}")
     print(f"   gap     : {MSG_GAP}s between messages")
     print(f"   max up  : {MAX_UP//3600}h {MAX_UP%3600//60}m")
