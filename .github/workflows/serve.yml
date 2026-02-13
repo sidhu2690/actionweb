@@ -1,0 +1,54 @@
+name: ⚔️ MindDuel Live
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: mindduel
+  cancel-in-progress: false
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -q flask groq
+
+      - name: Start server
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python server.py &
+          for i in $(seq 1 15); do
+            curl -s http://localhost:8080 > /dev/null && break
+            sleep 1
+          done
+          echo "✅ Server is up on :8080"
+
+      - name: Start tunnel
+        run: |
+          curl -sL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:8080 \
+            --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          echo "==========================================="
+          echo "⚔️  $URL"
+          echo "==========================================="
+
+      - name: Keep alive
+        run: |
+          echo "MindDuel is live. Sleeping 5h 55m..."
+          sleep 21300
+          echo "⏰ Time's up."
