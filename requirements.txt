@@ -1,1 +1,1 @@
-flask
+google-generativeai
