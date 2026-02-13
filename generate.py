@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
-"""Pick a topic, generate an AI debate, build the static site."""
+"""Generate a real back-and-forth AI debate, one message at a time."""
 
 import json, os, re, random, pathlib, datetime, sys, time
 
-ROOT      = pathlib.Path(__file__).parent
-DEBATES   = ROOT / "debates"
-DOCS      = ROOT / "docs"
-PAGES     = DOCS / "debates"
-TOPICS    = ROOT / "topics.json"
+ROOT    = pathlib.Path(__file__).parent
+DEBATES = ROOT / "debates"
+DOCS    = ROOT / "docs"
+PAGES   = DOCS / "debates"
+TOPICS  = ROOT / "topics.json"
 
-# ── personas ──────────────────────────────────────────────
-NOVA  = {
-    "name": "Nova", "role": "The Optimist", "color": "#4a9eff",
-    "desc": "empathetic, progressive, hopeful — argues with human impact and vision"
-}
-AXIOM = {
-    "name": "Axiom", "role": "The Skeptic", "color": "#ff6b4a",
-    "desc": "analytical, pragmatic, skeptical — argues with logic, data, and caution"
-}
+MODEL   = "llama-3.1-8b-instant"       # 14,400 RPD · 500K TPD
+BACKUP  = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+ROUNDS = [
+    ("opening",    "State your opening position."),
+    ("challenge",  "Directly challenge what the other just said."),
+    ("evidence",   "Give a real-world example or evidence."),
+    ("weakness",   "Expose a weakness in their argument."),
+    ("closing",    "Give your final statement. Leave tension unresolved."),
+]
+
+NOVA_SYSTEM = """You are Nova — The Optimist.
+You are empathetic, progressive, hopeful.
+You argue with human impact, emotion, and vision.
+You are in a debate. Keep responses under 80 words. Be sharp and direct. No fluff."""
+
+AXIOM_SYSTEM = """You are Axiom — The Skeptic.
+You are analytical, pragmatic, skeptical.
+You argue with logic, data, and caution.
+You are in a debate. Keep responses under 80 words. Be sharp and direct. No fluff."""
 
 # ── helpers ───────────────────────────────────────────────
 def slugify(t):
@@ -25,8 +36,7 @@ def slugify(t):
 
 def reading_time(messages):
     words = sum(len(m["message"].split()) for m in messages)
-    mins  = max(1, round(words / 200))
-    return f"{mins} min read"
+    return f"{max(1, round(words / 200))} min read"
 
 def load_all():
     out = []
@@ -37,66 +47,100 @@ def load_all():
 def used_topics():
     return {d["topic"] for d in load_all()}
 
-# ── topic picker ──────────────────────────────────────────
 def pick():
     pool = json.loads(TOPICS.read_text())
     done = used_topics()
     avail = [t for t in pool if t not in done]
     if not avail:
-        avail = pool                       # recycle
+        avail = pool
     return random.choice(avail)
 
-# ── gemini call ───────────────────────────────────────────
-def generate(topic):
-    import google.generativeai as genai
+# ── single message call ──────────────────────────────────
+def call_llm(client, system, conversation, instruction, model=MODEL):
+    """One small API call → one short message back."""
+    messages = [{"role": "system", "content": system}]
 
-    key = os.environ.get("GEMINI_API_KEY")
+    # add conversation history
+    for msg in conversation:
+        if msg["role"] == "speaker":
+            messages.append({"role": "assistant" if msg["is_self"] else "user", "content": msg["text"]})
+
+    # add the round instruction
+    messages.append({"role": "user", "content": instruction})
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.85,
+            max_tokens=150,         # short outputs only
+        )
+        text = resp.choices[0].message.content.strip()
+        # remove any quotes or "Nova:" / "Axiom:" prefix
+        text = re.sub(r'^(Nova|Axiom)\s*[:—-]\s*', '', text, flags=re.IGNORECASE)
+        text = text.strip('"')
+        tokens = resp.usage.total_tokens
+        return text, tokens
+    except Exception as e:
+        if model == MODEL:
+            print(f"     ⚠ {MODEL} failed, trying backup...")
+            return call_llm(client, system, conversation, instruction, model=BACKUP)
+        raise e
+
+# ── generate full debate ──────────────────────────────────
+def generate(topic):
+    key = os.environ.get("GROQ_API_KEY")
     if not key:
-        print("✖  Set GEMINI_API_KEY secret in repo settings")
+        print("✖  Set GROQ_API_KEY secret")
+        print("   → https://console.groq.com/keys (free)")
         sys.exit(1)
 
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    from groq import Groq
+    client = Groq(api_key=key)
 
-    prompt = f"""You are a debate script writer.
+    messages = []           # final output
+    nova_history = []       # nova's view of conversation
+    axiom_history = []      # axiom's view of conversation
+    total_tokens = 0
+    total_calls = 0
 
-Topic: "{topic}"
+    for round_num, (round_name, round_desc) in enumerate(ROUNDS, 1):
+        print(f"\n  ── Round {round_num}: {round_name} ──")
 
-Speakers
-  Nova  (The Optimist) — empathetic, progressive, hopeful.
-  Axiom (The Skeptic)  — analytical, pragmatic, skeptical.
+        # ── Nova speaks ──
+        if messages:
+            last_axiom = messages[-1]["message"]
+            nova_instruction = f'Topic: "{topic}"\nRound: {round_name}\n{round_desc}\nAxiom just said: "{last_axiom}"\nRespond in under 80 words.'
+        else:
+            nova_instruction = f'Topic: "{topic}"\nRound: {round_name}\n{round_desc}\nYou speak first. Under 80 words.'
 
-Rules
-  • Exactly 5 rounds. Nova speaks first each round. 10 messages total.
-  • Each message 60-100 words. Sharp, direct, no fluff.
-  • They must engage each other's points, not just monologue.
-  • Round 1 → Opening positions
-  • Round 2 → Direct challenge
-  • Round 3 → Real-world evidence / examples
-  • Round 4 → Expose weakness in opponent's logic
-  • Round 5 → Closing (leave tension unresolved)
+        nova_text, tokens = call_llm(client, NOVA_SYSTEM, nova_history, nova_instruction)
+        total_tokens += tokens
+        total_calls += 1
+        messages.append({"speaker": "Nova", "message": nova_text})
+        nova_history.append({"role": "speaker", "is_self": True, "text": nova_text})
+        axiom_history.append({"role": "speaker", "is_self": False, "text": nova_text})
+        print(f"     Nova ({len(nova_text.split())}w): {nova_text[:80]}...")
 
-Output ONLY a raw JSON array — no markdown fences, no commentary:
-[{{"speaker":"Nova","message":"..."}},{{"speaker":"Axiom","message":"..."}}, ...]"""
+        time.sleep(0.5)     # stay well within 30 RPM
 
-    for attempt in range(3):
-        try:
-            resp = model.generate_content(prompt)
-            text = resp.text.strip()
-            # strip markdown fences if present
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            msgs = json.loads(text)
-            if isinstance(msgs, list) and len(msgs) >= 8:
-                return msgs[:10]
-        except Exception as e:
-            print(f"  attempt {attempt+1} failed: {e}")
-            time.sleep(3)
+        # ── Axiom speaks ──
+        axiom_instruction = f'Topic: "{topic}"\nRound: {round_name}\n{round_desc}\nNova just said: "{nova_text}"\nRespond in under 80 words.'
 
-    print("✖  Could not generate debate after 3 attempts")
-    sys.exit(1)
+        axiom_text, tokens = call_llm(client, AXIOM_SYSTEM, axiom_history, axiom_instruction)
+        total_tokens += tokens
+        total_calls += 1
+        messages.append({"speaker": "Axiom", "message": axiom_text})
+        axiom_history.append({"role": "speaker", "is_self": True, "text": axiom_text})
+        nova_history.append({"role": "speaker", "is_self": False, "text": axiom_text})
+        print(f"     Axiom ({len(axiom_text.split())}w): {axiom_text[:80]}...")
 
-# ── save debate json ──────────────────────────────────────
+        time.sleep(0.5)
+
+    print(f"\n  📊 stats: {total_calls} calls · {total_tokens:,} tokens · {total_tokens/500000*100:.2f}% of daily limit")
+    return messages
+
+# ── save ──────────────────────────────────────────────────
 def save(topic, messages):
     DEBATES.mkdir(exist_ok=True)
     now  = datetime.datetime.now(datetime.timezone.utc)
@@ -167,13 +211,16 @@ font-size:.7rem;margin-top:.5rem}
 
 .nav{text-align:center;padding:1rem;font-size:.8rem}
 
+.stats{max-width:700px;margin:0 auto;padding:0 1rem;text-align:center}
+.stats span{color:var(--dm);font-size:.7rem;margin:0 .5rem}
+
 @media(max-width:500px){
   .msg{max-width:95%;font-size:.82rem}
   header h1{font-size:1.2rem}
   .topic{font-size:1.05rem}
 }"""
 
-ROUNDS = [
+ROUND_LABELS = [
     "Round 1 · Opening Positions",
     "Round 2 · Direct Challenge",
     "Round 3 · Evidence & Examples",
@@ -189,10 +236,11 @@ def bubble_html(messages):
             who = "nova" if i % 2 == 0 else "axiom"
         if i % 2 == 0:
             ri = i // 2
-            label = ROUNDS[ri] if ri < len(ROUNDS) else f"Round {ri+1}"
+            label = ROUND_LABELS[ri] if ri < len(ROUND_LABELS) else f"Round {ri+1}"
             h += f'<div class="round-label">{label}</div>\n'
+        role = "The Optimist" if who == "nova" else "The Skeptic"
         h += f'''<div class="bubble {who}">
-  <div class="name {who}">{m["speaker"]} · {NOVA["role"] if who=="nova" else AXIOM["role"]}</div>
+  <div class="name {who}">{m["speaker"]} · {role}</div>
   <div class="msg">{m["message"]}</div>
 </div>\n'''
     return h
@@ -212,7 +260,7 @@ def page(title, body, nav_home=False):
 </header>
 {nav}
 {body}
-<footer>generated by ai · hosted on github pages · zero cost</footer>
+<footer>generated by ai · powered by groq · hosted on github pages · zero cost</footer>
 </body></html>"""
 
 def build_debate_page(d):
@@ -227,8 +275,8 @@ def build_index(debates):
 
     latest = debates[0]
     body  = f'<div class="topic">"{latest["topic"]}"</div>\n'
-    body += f'<div class="meta">'
-    body += f'<span class="badge">● LATEST</span> '
+    body += '<div class="meta">'
+    body += '<span class="badge">● LATEST</span> '
     body += f'<span>{latest["display"]}</span>'
     body += f'<span>{latest["reading"]}</span></div>\n'
     body += f'<div class="chat">\n{bubble_html(latest["messages"])}</div>\n'
@@ -242,17 +290,10 @@ def build_index(debates):
 </a>\n'''
         body += '</div>\n'
 
+    count = len(debates)
+    body += f'<div class="stats"><span>{count} debate{"s" if count != 1 else ""} generated</span>'
+    body += '<span>·</span><span>new debate every 6 hours</span></div>\n'
     return page("Nova vs Axiom", body)
-
-def build_archive(debates):
-    body = '<div class="archive" style="margin-top:1rem"><h2>All Debates</h2>\n'
-    for d in debates:
-        body += f'''<a class="card" href="debates/{d["filename"]}.html">
-  <div class="t">{d["topic"]}</div>
-  <div class="d">{d["display"]} · {d["reading"]}</div>
-</a>\n'''
-    body += '</div>\n'
-    return page("Archive — Nova vs Axiom", body)
 
 def build_site():
     DOCS.mkdir(exist_ok=True)
@@ -260,9 +301,7 @@ def build_site():
     (DOCS / ".nojekyll").touch()
 
     debates = load_all()
-
     (DOCS / "index.html").write_text(build_index(debates))
-    (DOCS / "archive.html").write_text(build_archive(debates))
 
     for d in debates:
         (PAGES / f'{d["filename"]}.html').write_text(build_debate_page(d))
@@ -271,21 +310,28 @@ def build_site():
 
 # ── main ──────────────────────────────────────────────────
 def main():
-    print("🎯 picking topic...")
+    print("=" * 50)
+    print("🧠 NOVA vs AXIOM — Debate Generator")
+    print(f"   model: {MODEL}")
+    print("=" * 50)
+
+    print("\n🎯 picking topic...")
     topic = pick()
-    print(f"  → {topic}")
+    print(f'  → "{topic}"')
 
-    print("🤖 generating debate...")
+    print("\n🤖 generating debate (10 calls, ~80 words each)...")
     messages = generate(topic)
-    print(f"  → {len(messages)} messages")
+    print(f"\n  → {len(messages)} messages")
 
-    print("💾 saving...")
+    print("\n💾 saving...")
     save(topic, messages)
 
-    print("🔨 building site...")
+    print("\n🔨 building site...")
     build_site()
 
-    print("✅ done")
+    print("\n" + "=" * 50)
+    print("✅ DONE")
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()
