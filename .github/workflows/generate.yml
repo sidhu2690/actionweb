@@ -3,7 +3,7 @@ name: 🧠 Generate Debate
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"       # 00:00 06:00 12:00 18:00 UTC
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -23,11 +23,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
 
-      - run: pip install -q google-generativeai
+      - run: pip install -q groq
 
       - name: Generate debate & build site
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python generate.py
 
       - name: Commit & push
