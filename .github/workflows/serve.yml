@@ -1,4 +1,4 @@
-name: ⚔️ MindDuel Live
+name: 🏛️ Agora Live
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "0 */6 * * *"
 
 concurrency:
-  group: mindduel
+  group: agora
   cancel-in-progress: false
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
             curl -s http://localhost:8080 > /dev/null && break
             sleep 1
           done
-          echo "✅ Server is up on :8080"
+          echo "✅ Server is up"
 
       - name: Start tunnel
         run: |
@@ -44,11 +44,11 @@ jobs:
             sleep 1
           done
           echo "==========================================="
-          echo "⚔️  $URL"
+          echo "🏛️  $URL"
           echo "==========================================="
 
       - name: Keep alive
         run: |
-          echo "MindDuel is live. Sleeping 5h 55m..."
+          echo "Agora is live. Sleeping 5h 55m..."
           sleep 21300
           echo "⏰ Time's up."
