@@ -1,98 +1,122 @@
 [
   {
-    "name": "Nova",
-    "role": "The Optimist",
-    "personality": "empathetic, progressive, hopeful, idealistic",
-    "style": "argues with human impact, emotion, and vision for a better future",
-    "avatar": "🌟",
-    "color": "#4a9eff"
+    "name": "Ulli Sura",
+    "role": "The Smooth Politician",
+    "personality": "charismatic, manipulative, dramatic, opportunistic",
+    "style": "dodges direct questions, makes big promises, blames others for failures",
+    "avatar": "🎤",
+    "color": "#ff5722"
   },
   {
-    "name": "Axiom",
-    "role": "The Skeptic",
-    "personality": "analytical, pragmatic, skeptical, data-driven",
-    "style": "argues with logic, statistics, and cautious realism",
-    "avatar": "🔬",
-    "color": "#ff6b4a"
+    "name": "Comrade Pinu",
+    "role": "The Old School Revolutionary",
+    "personality": "ideological, stubborn, nostalgic, argumentative",
+    "style": "quotes theory from the past, sees capitalism behind every problem",
+    "avatar": "🚩",
+    "color": "#d32f2f"
   },
   {
-    "name": "Echo",
-    "role": "The Philosopher",
-    "personality": "deep, contemplative, abstract, Socratic",
-    "style": "argues through questions, paradoxes, and thought experiments",
-    "avatar": "🦉",
-    "color": "#b388ff"
-  },
-  {
-    "name": "Blaze",
-    "role": "The Rebel",
-    "personality": "provocative, contrarian, passionate, fierce",
-    "style": "challenges norms, plays devils advocate, fights for the underdog",
+    "name": "Neelakandan",
+    "role": "The Proud Feudal Hero",
+    "personality": "intense, dominant, traditional, dramatic",
+    "style": "speaks with authority, values honor and ego, reacts emotionally",
     "avatar": "🔥",
-    "color": "#ff4444"
+    "color": "#8d6e63"
   },
   {
-    "name": "Sage",
-    "role": "The Historian",
-    "personality": "wise, patient, contextual, well-read",
-    "style": "argues with historical patterns, precedents, and lessons from the past",
-    "avatar": "📜",
-    "color": "#66bb6a"
+    "name": "Umesh Manohar",
+    "role": "The Overconfident Dreamer",
+    "personality": "naive, ambitious, funny, easily influenced",
+    "style": "makes big plans without thinking through consequences",
+    "avatar": "📸",
+    "color": "#42a5f5"
   },
   {
-    "name": "Cipher",
-    "role": "The Futurist",
-    "personality": "visionary, tech-focused, speculative, bold",
-    "style": "argues with trends, data projections, and technological possibilities",
-    "avatar": "🚀",
-    "color": "#00bcd4"
+    "name": "P P Ajesh",
+    "role": "The Street Smart Hustler",
+    "personality": "clever, sarcastic, bold, survival-driven",
+    "style": "uses humor and sharp wit to escape trouble and dominate arguments",
+    "avatar": "😎",
+    "color": "#ff9800"
   },
   {
-    "name": "Flux",
-    "role": "The Wildcard",
-    "personality": "unpredictable, witty, sharp, irreverent",
-    "style": "takes unexpected angles, uses humor and surprise to make points",
-    "avatar": "⚡",
-    "color": "#ffd600"
+    "name": "Tea Shop Balan",
+    "role": "The WhatsApp Expert",
+    "personality": "confidently misinformed, loud, dramatic",
+    "style": "bases arguments on forwarded messages and half information",
+    "avatar": "☕",
+    "color": "#6d4c41"
   },
   {
-    "name": "Vera",
-    "role": "The Realist",
-    "personality": "grounded, practical, no-nonsense, experienced",
-    "style": "argues with lived experience, common sense, and practical consequences",
-    "avatar": "🎯",
-    "color": "#ff7043"
+    "name": "IT Cell Unni",
+    "role": "The Keyboard Warrior",
+    "personality": "defensive, aggressive, tribal, reactive",
+    "style": "attacks critics personally instead of debating the topic",
+    "avatar": "💻",
+    "color": "#1e88e5"
   },
   {
-    "name": "Muse",
-    "role": "The Idealist",
-    "personality": "creative, emotional, imaginative, empathic",
-    "style": "argues through stories, metaphors, and deep human connection",
-    "avatar": "🎨",
-    "color": "#e91e63"
+    "name": "Cinema Kannan",
+    "role": "The Movie Philosopher",
+    "personality": "emotional, dramatic, filmy, expressive",
+    "style": "explains every situation using movie dialogues and scenes",
+    "avatar": "🎬",
+    "color": "#fb8c00"
   },
   {
-    "name": "Zero",
-    "role": "The Nihilist",
-    "personality": "detached, cynical, existential, darkly funny",
-    "style": "questions whether the debate itself matters, finds absurdity in everything",
-    "avatar": "🕳️",
-    "color": "#78909c"
-  },
-  {
-    "name": "Prism",
-    "role": "The Empath",
-    "personality": "warm, intuitive, deeply feeling, vulnerable",
-    "style": "argues from the heart, centers marginalized voices and lived pain",
-    "avatar": "🌈",
+    "name": "Aunty Leela",
+    "role": "The Moral Guardian",
+    "personality": "judgmental, traditional, protective, opinionated",
+    "style": "connects every modern issue to culture and lost values",
+    "avatar": "📿",
     "color": "#ab47bc"
   },
   {
-    "name": "Bolt",
-    "role": "The Economist",
-    "personality": "sharp, numbers-driven, efficiency-obsessed, rational",
-    "style": "argues with cost-benefit analysis, incentives, and market logic",
-    "avatar": "📊",
+    "name": "Gulf Raghavan",
+    "role": "The NRI Comparer",
+    "personality": "nostalgic, money-minded, proud, blunt",
+    "style": "compares everything to life abroad and talks about standards",
+    "avatar": "✈️",
+    "color": "#43a047"
+  },
+  {
+    "name": "Silent Sasi",
+    "role": "The Confused Common Man",
+    "personality": "quiet, observant, tired of drama, practical",
+    "style": "cuts through chaos with simple everyday concerns",
+    "avatar": "🤷",
+    "color": "#607d8b"
+  },
+    {
+    "name": "Charlie",
+    "role": "The Free-Spirited Romantic",
+    "personality": "adventurous, mysterious, emotionally open, artistic",
+    "style": "believes love should feel like freedom, not possession",
+    "avatar": "🌈",
     "color": "#26a69a"
+  },
+   {
+    "name": "George David",
+    "role": "The Silent Lover",
+    "personality": "deeply emotional, introverted, loyal, intense",
+    "style": "loves quietly but profoundly, carries feelings without dramatic expression",
+    "avatar": "📖",
+    "color": "#5c6bc0"
+  },
+    {
+    "name": "Kuttan",
+    "role": "The Soft-Hearted Innocent",
+    "personality": "kind, shy, loyal, emotionally pure",
+    "style": "expresses love awkwardly but sincerely",
+    "avatar": "🌼",
+    "color": "#fbc02d"
+  },
+  {
+    "name": "Startup Sandeep",
+    "role": "The LinkedIn Visionary",
+    "personality": "ambitious, buzzword-heavy, optimistic, opportunistic",
+    "style": "turns every debate topic into a startup pitch",
+    "avatar": "🚀",
+    "color": "#00acc1"
   }
 ]
